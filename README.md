@@ -1,0 +1,2 @@
+# JraRawDataImporter
+JRA_VANの公式データをRawデータのまま取得、保存するpythonプログラムです。使用者はどのDataspecを保存するかを選択することが出来、中断しても続きからプログラムが動作するような設計です。
