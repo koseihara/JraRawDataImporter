@@ -1,131 +1,178 @@
 """
-Raw データのファイル書き出し — dataspec ディレクトリに直接保存
-
-JV-Link の物理ファイル境界ごとに .jvdat ファイルを生成する。
-同名ファイルは上書き（差分更新で最新版に置き換える）。
-書き込みは .tmp 経由でアトミックに行う。
+JV-Link の物理ファイル境界ごとに staging へ raw ファイルを書き出す。
 """
 
-import logging
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 from config import RAW_FILE_EXT
 
-logger = logging.getLogger(__name__)
+
+@dataclass
+class StagedFile:
+    logical_filename: str
+    staging_name: str
+    sha256: str
+    byte_count: int
+    record_count: int
+
+    def to_dict(self) -> dict:
+        return {
+            "logical_filename": self.logical_filename,
+            "staging_name": self.staging_name,
+            "sha256": self.sha256,
+            "byte_count": self.byte_count,
+            "record_count": self.record_count,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "StagedFile":
+        return cls(
+            logical_filename=data["logical_filename"],
+            staging_name=data["staging_name"],
+            sha256=data["sha256"],
+            byte_count=int(data["byte_count"]),
+            record_count=int(data["record_count"]),
+        )
 
 
 class RawFileWriter:
-    """
-    JV-Link のレコードを dataspec ディレクトリに直接保存する。
+    def __init__(self, run_dir: Path):
+        self.run_dir = Path(run_dir)
+        self.staging_dir = self.run_dir / "staging"
+        self.manifest_path = self.run_dir / "candidate_manifest.jsonl"
+        self.staging_dir.mkdir(parents=True, exist_ok=True)
 
-    構成:
-        <archive>/<dataspec>/
-            <filename1>.jvdat
-            <filename2>.jvdat
-            ...
-    """
+        existing = self._load_existing_entries()
+        self.total_files = len(existing)
+        self.total_records = sum(entry.record_count for entry in existing.values())
+        self.total_bytes = sum(entry.byte_count for entry in existing.values())
+        self._sequence = len(list(self.staging_dir.glob(f"*{RAW_FILE_EXT}"))) + 1
 
-    def __init__(self, dataspec_dir: Path):
-        self._dir = Path(dataspec_dir)
-        self._dir.mkdir(parents=True, exist_ok=True)
-
-        # 現在書き込み中のファイル情報
         self._current_filename: Optional[str] = None
         self._current_fh = None
+        self._current_hasher = None
         self._current_temp_path: Optional[Path] = None
-        self._current_output_path: Optional[Path] = None
-
-        # 累計統計
-        self.total_files: int = 0
-        self.total_records: int = 0
-        self.total_bytes: int = 0
-
-    # ----------------------------------------------------------
-    # ファイル操作
-    # ----------------------------------------------------------
+        self._current_staging_name: Optional[str] = None
+        self._current_byte_count = 0
+        self._current_record_count = 0
+        self._closed_entry: Optional[StagedFile] = None
 
     def ensure_file_for(self, filename: str) -> bool:
-        """
-        指定された JV-Link ファイル名に対応する出力ファイルを準備する。
-        ファイル名が変わった場合は現在のファイルを閉じて新しいファイルを開く。
-
-        Returns:
-            True = ファイルが切り替わった, False = 同じファイル
-        """
         if filename == self._current_filename and self._current_fh is not None:
             return False
-
         if self._current_fh is not None:
             self._finalize_current_file()
-
         self._open_temp_file(filename)
         return True
 
     def write_record(self, raw_bytes: bytes) -> None:
-        """1レコード分の生バイト列を書き込む。"""
         if self._current_fh is None:
-            raise RuntimeError("ファイルが開かれていません")
+            raise RuntimeError("staging file is not open")
 
         self._current_fh.write(raw_bytes)
-
-        # レコード末尾に改行がなければ追加
+        self._current_hasher.update(raw_bytes)
+        self._current_byte_count += len(raw_bytes)
         if raw_bytes and not raw_bytes.endswith(b"\n"):
             self._current_fh.write(b"\n")
+            self._current_hasher.update(b"\n")
+            self._current_byte_count += 1
 
+        self._current_record_count += 1
         self.total_records += 1
         self.total_bytes += len(raw_bytes)
+        if raw_bytes and not raw_bytes.endswith(b"\n"):
+            self.total_bytes += 1
 
     def close(self) -> None:
-        """現在開いているファイルを閉じて .tmp をリネームする。"""
         if self._current_fh is not None:
             self._finalize_current_file()
 
+    def abort(self) -> None:
+        if self._current_fh is None:
+            return
+
+        self._current_fh.close()
+        self._current_fh = None
+        if self._current_temp_path and self._current_temp_path.exists():
+            self._current_temp_path.unlink()
+
+        self._current_filename = None
+        self._current_staging_name = None
+        self._current_temp_path = None
+        self._current_hasher = None
+        self._current_byte_count = 0
+        self._current_record_count = 0
+
     def cleanup_temps(self) -> None:
-        """残った .tmp ファイルを削除する（前回中断の残骸）。"""
-        for tmp in self._dir.glob("*.tmp"):
-            logger.info("残存 .tmp 削除: %s", tmp.name)
+        for tmp in self.staging_dir.glob("*.tmp"):
             tmp.unlink()
 
-    # ----------------------------------------------------------
-    # 内部メソッド
-    # ----------------------------------------------------------
+    def consume_closed_entry(self) -> Optional[StagedFile]:
+        entry = self._closed_entry
+        self._closed_entry = None
+        return entry
 
     def _open_temp_file(self, filename: str) -> None:
-        """新しい .tmp ファイルを開く。"""
         safe_name = filename.replace("\\", "_").replace("/", "_").strip()
         if not safe_name:
-            safe_name = f"unknown_{self.total_files:04d}"
+            safe_name = "unknown"
+        staging_name = f"{self._sequence:06d}__{safe_name}{RAW_FILE_EXT}"
+        self._sequence += 1
 
-        self._current_output_path = self._dir / f"{safe_name}{RAW_FILE_EXT}"
-        self._current_temp_path = self._current_output_path.with_suffix(".tmp")
         self._current_filename = filename
+        self._current_staging_name = staging_name
+        self._current_temp_path = self.staging_dir / f"{staging_name}.tmp"
         self._current_fh = open(self._current_temp_path, "wb")
-
-        logger.info("ファイル開始: %s", safe_name)
+        self._current_hasher = hashlib.sha256()
+        self._current_byte_count = 0
+        self._current_record_count = 0
 
     def _finalize_current_file(self) -> None:
-        """一時ファイルを閉じてアトミックリネーム。"""
         if self._current_fh is None:
             return
 
         self._current_fh.close()
         self._current_fh = None
 
-        # .tmp → 本ファイルにリネーム（上書き）
-        self._current_temp_path.replace(self._current_output_path)
+        final_path = self.staging_dir / self._current_staging_name
+        self._current_temp_path.replace(final_path)
+        entry = StagedFile(
+            logical_filename=self._current_filename,
+            staging_name=self._current_staging_name,
+            sha256=self._current_hasher.hexdigest(),
+            byte_count=self._current_byte_count,
+            record_count=self._current_record_count,
+        )
+        self._append_manifest(entry)
         self.total_files += 1
-
-        logger.info("ファイル完了: %s", self._current_filename)
+        self._closed_entry = entry
 
         self._current_filename = None
+        self._current_staging_name = None
         self._current_temp_path = None
-        self._current_output_path = None
+        self._current_hasher = None
+        self._current_byte_count = 0
+        self._current_record_count = 0
 
-    # ----------------------------------------------------------
-    # プロパティ
-    # ----------------------------------------------------------
+    def _append_manifest(self, entry: StagedFile) -> None:
+        with open(self.manifest_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry.to_dict(), ensure_ascii=False) + "\n")
 
-    @property
-    def current_filename(self) -> Optional[str]:
-        return self._current_filename
+    def _load_existing_entries(self) -> dict[str, StagedFile]:
+        entries: dict[str, StagedFile] = {}
+        if not self.manifest_path.exists():
+            return entries
+        with open(self.manifest_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                entry = StagedFile.from_dict(json.loads(line))
+                entries[entry.logical_filename] = entry
+        return entries

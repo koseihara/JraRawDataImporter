@@ -1,194 +1,239 @@
-# JV-Link Raw Data Fetcher
+# JV-Link Raw Data Downloader
 
-JRA-VAN JV-Link から蓄積系データを取得し、**生データ（SJIS/cp932）のまま**ローカルに保存するプログラム。
-後工程で PostgreSQL へ投入するための中間保存を目的とする。
+JRA-VAN JV-Link から raw データを取得し、そのまま cp932 の `.jvdat` として保存する Windows 向け CLI です。
 
-## 設計思想
+このリポジトリの責務は次に限定します。
 
-- **パースしない** — レコードは JV-Link が返した生バイト列のまま保存
-- **物理ファイル単位で保存** — JV-Link 内部のファイル境界を保持（再現性）
-- **上書き更新** — 同名ファイルは最新版で上書き（過去データの訂正にも対応）
-- **差分更新対応** — セットアップ完了後、前回以降の新規データのみを取得可能
-- **アトミック書き込み** — `.tmp` 経由で書き込み、完了後にリネーム（電源断でもデータ破損しない）
-- **dataspec ごとに逐次実行** — JV-Link の既知制約（複数 dataspec 同時指定で低速化）を回避
+- raw ファイルの取得
+- 中断後の再開
+- 保存済みアーカイブの検証
+- 人間向け view の公開
 
-## 対象データ
+このリポジトリは parser ではありません。
+PostgreSQL への投入責務も持ちません。
 
-蓄積系（`JVOpen option=4` セットアップ対象）のみ。以下は**除外**：
+後続の parser アプリは、この downloader が出力する raw アーカイブを読む前提です。
 
-| 除外 | 理由 |
-|------|------|
-| TOKU | セットアップでは最新分のみ、過去分は option=1 が必要 |
-| TCOV/RCOV/TCVN/RCVN | 今週データ系、セットアップ対象外 |
-| 0Bxx (速報系) | JVRTOpen 系、セットアップ対象外 |
+## 現在の正式実装
 
-## 前提条件
+現時点の正式実装は Python です。
 
-- **Windows** （JV-Link COM は Windows 専用）
-- **JV-Link インストール済み** + JRA-VAN Data Lab 会員
-- **Python 3.10+**
-- **pywin32**: `pip install pywin32`
+- package 名: `jvlink-raw-fetcher`
+- CLI 名: `jvlink-raw-fetcher`
+- 互換 shim: `python main.py ...`
 
-## ファイル構成
+`csharp-poc/` には比較用の .NET x86 PoC を置いていますが、本番 parity 実装ではありません。
 
-```
-├── main.py              # CLI エントリーポイント
-├── config.py            # 定数・dataspec 定義
-├── jvlink_session.py    # JV-Link COM ラッパー
-├── raw_writer.py        # ファイル書き出し（アトミック書き込み）
-├── job_runner.py        # ジョブ実行エンジン（セットアップ・差分取得）
-├── sync_state.py        # 同期状態管理（.sync_state.json）
-└── .jvconfig.json       # 保存先設定（初回実行時に自動生成）
-```
+## 必要環境
 
-## 使い方
+- Windows
+- JV-Link を利用できる環境
+- Python 3.10+
+- `pywin32`
 
-### 1. JV-Link の設定確認
+JV-Link COM を直接使うコマンドは 32bit Python が必要です。
 
-```bash
-python main.py config
-```
+- `setup`
+- `update`
+- `jvlink-config`
 
-### 2. ダウンロード状態の確認
+次のコマンドは COM を使わないので 64bit Python でも実行できます。
 
-```bash
-python main.py status
+- `status`
+- `verify`
+- `refresh-view`
+- `doctor`
+
+## インストール
+
+### 開発中のリポジトリから使う
+
+```powershell
+pip install -e .
 ```
 
-出力例:
-```
-=== ダウンロード済みデータ ===
-dataspec  status          files  last_update
---------------------------------------------------
-RACE      completed        5027  2026-02-23
-DIFF      not started
-DIFN      not started
-BLOD      not started
-...
+### 32bit Python 環境に pywin32 を入れる
+
+```powershell
+pip install pywin32
 ```
 
-### 3. セットアップ（全量ダウンロード）
+## 設定ファイル
 
-```bash
-# 特定の dataspec を指定
-python main.py setup RACE DIFF BLOD
+設定ファイルは user scope に保存されます。
 
-# 全 dataspec
-python main.py setup --all
+- 既定: `%LOCALAPPDATA%\jvlink-raw-fetcher\config.json`
+- 旧 `.jvconfig.json` がある場合は初回実行時に移行します
 
-# 2020年以降のみ
-python main.py setup RACE --from 20200101
+既定値:
+
+- `archive_dir = D:\jvdata`
+- `jvlink_temp_dir = C:\JVLinkTemp`
+
+優先順位:
+
+1. CLI 引数
+2. 環境変数
+3. user config
+4. 既定値
+
+環境変数:
+
+- `JVLINK_RAW_ARCHIVE_DIR`
+- `JVLINK_RAW_TEMP_DIR`
+- `JVLINK_RAW_LOG_LEVEL`
+- `JVLINK_RAW_CONFIG_PATH`
+
+## コマンド
+
+### `doctor`
+
+利用開始前の環境診断を行います。
+
+```powershell
+jvlink-raw-fetcher doctor
+jvlink-raw-fetcher doctor --archive D:\jvdata --temp-dir C:\JVLinkTemp
 ```
 
-既にセットアップ完了済みの dataspec を指定した場合、再実行の確認が行われます。
-`--force` で確認をスキップできます。
+診断項目:
 
-### 4. 差分更新
+- Windows であるか
+- 32bit Python か
+- `pywin32` があるか
+- JV-Link COM が登録されているか
+- COM dispatch が可能か
+- archive/temp dir に書けるか
 
-セットアップ完了済みの dataspec に対して、前回以降の新規データのみを取得します。
+### `jvlink-config`
 
-```bash
-# セットアップ済みの全 dataspec を更新
-python main.py update
+JV-Link の設定ダイアログを開きます。
 
-# 特定の dataspec のみ
-python main.py update RACE
+```powershell
+jvlink-raw-fetcher jvlink-config
 ```
 
-セットアップ未完了の dataspec は自動的にスキップされます。
-0 からの全量ダウンロードが実行されることはありません。
+旧コマンド `config` も alias として残しています。
 
-### 5. データ移行（旧構造からの移行）
+### `status`
 
-旧構造（`setup/RACE/timestamp/files/`）から新構造へデータを移行します。
+dataspec ごとの状態を表示します。
 
-```bash
-python main.py migrate
+```powershell
+jvlink-raw-fetcher status
+jvlink-raw-fetcher status --archive D:\jvdata
 ```
 
-### 保存先の設定
+### `setup`
 
-初回実行時に保存先ディレクトリを尋ねられます（デフォルト: `D:\jvdata`）。
-設定は `.jvconfig.json` に保存され、次回以降は自動的に読み込まれます。
+JV-Link からセットアップ取得を行います。32bit Python が必要です。
 
-`--archive` オプションで一時的に別のパスを指定することも可能です:
-```bash
-python main.py status --archive E:\backup\jvdata
+```powershell
+jvlink-raw-fetcher setup RACE
+jvlink-raw-fetcher setup RACE DIFF BLOD
+jvlink-raw-fetcher setup --all
+jvlink-raw-fetcher setup RACE --from 20200101
 ```
 
-## 出力構造
+### `update`
 
+公開済み `current` の `last_successful_timestamp` から差分更新します。32bit Python が必要です。
+
+```powershell
+jvlink-raw-fetcher update
+jvlink-raw-fetcher update RACE
 ```
+
+### `verify`
+
+アーカイブの整合性検査を行います。
+
+```powershell
+jvlink-raw-fetcher verify RACE --archive D:\jvdata
+jvlink-raw-fetcher verify --all --archive D:\jvdata
+```
+
+### `refresh-view`
+
+人間向けの `view/current` と `view/previous` を再生成します。
+
+```powershell
+jvlink-raw-fetcher refresh-view RACE --archive D:\jvdata
+jvlink-raw-fetcher refresh-view --all --archive D:\jvdata
+```
+
+## ディレクトリ構成
+
+```text
 D:\jvdata\
-├── RACE\                                   # dataspec ごとのフラットなディレクトリ
-│   ├── H1VM1986019920230808160612.jvd.jvdat   # 生データ（cp932）
-│   ├── RAVM1986019920230808160614.jvd.jvdat
-│   └── ...
-├── DIFF\
-│   └── ...
-└── .sync_state.json                        # 全 dataspec の同期状態
+  RACE\
+    refs\
+      current.json
+      previous.json
+    commits\
+      <commit_id>\
+        meta.json
+        manifest.jsonl
+    objects\
+      ab\
+        abcdef....jvdat
+    runs\
+      <run_id>\
+        run_state.json
+        staging\
+        candidate_manifest.jsonl
+    view\
+      current\
+        H1\
+        RA\
+        SE\
+      previous\
+        H1\
+        RA\
+        SE\
 ```
 
-### .sync_state.json
+## 後続アプリに渡す公開面
 
-```json
-{
-  "RACE": {
-    "last_timestamp": "20260223133238",
-    "last_synced_at": "2026-02-28T11:26:13+00:00",
-    "file_count": 5027,
-    "in_progress": false
-  }
-}
-```
+後続の parser が依存してよい公開面は次の 3 つです。
 
-- `last_timestamp`: 次回差分更新の起点（JVOpen が返す値）
-- `last_synced_at`: 最後に同期完了した日時
-- `file_count`: 保存済みファイル数
-- `in_progress`: セットアップ中断の検出に使用
+- `view/current/<format_code>/<logical_filename>.jvdat`
+- `refs/current.json`
+- `commits/<commit_id>/manifest.jsonl`
 
-## 中断時の動作
+`objects/` は内部実装です。
 
-### セットアップ中断
+## 安全性
 
-セットアップ中にプログラムが停止した場合、次回 `setup` 実行時に**最初からやり直し**ます。
+- 取得中のファイルは `runs/<run_id>/staging` にだけ書きます
+- 成功時だけ `refs/current.json` を更新します
+- 途中で失敗した run は `runs/<run_id>` に残り、再開できます
+- partial file は完了扱いにしません
+- ひとつ前の公開状態は `refs/previous.json` に残します
 
-JVOpen は毎回新しいセッションを返すため、中断後に前回スキップ済みのファイルが
-JRA 側で更新されている可能性があり、安全に再開できないためです。
+## 推奨運用
 
-### 差分更新中断
+1. `doctor` で環境診断を通す
+2. `jvlink-config` で JV-Link の設定を確認する
+3. `setup RACE` で初回取得する
+4. `verify RACE` で整合性を確認する
+5. `update RACE` を継続実行する
+6. 必要に応じて `refresh-view RACE` を実行する
 
-差分更新中に停止した場合は、次回 `update` で同じ `last_timestamp` から再取得されます。
-`last_timestamp` は全ファイル処理完了後にのみ更新されるため、データの漏れはありません。
+## ドキュメント
 
-### 書き込みの安全性
+- [現状アーキテクチャ整理](docs/current-architecture.md)
+- [Python と C# の比較メモ](docs/python-vs-csharp-comparison.md)
 
-ファイル書き込みは `.tmp` 経由で行い、完了後にリネームします。
-電源断や通信遮断が発生しても、元のファイルが破損することはありません。
+## トラブルシュート
 
-## トラブルシューティング
+### `JV-Link COM is expected to run under 32-bit Python`
 
-### COM オブジェクト生成エラー
-JV-Link が正しくインストールされているか確認：
-```bash
-reg query "HKCR\JVDTLab.JVLink"
-```
+`setup` / `update` / `jvlink-config` を 64bit Python で実行しています。32bit Python で再実行してください。
 
-### JVOpen が -1 や -302 を返す
-- dataspec の綴りを確認
-- JRA-VAN の会員資格・ログイン状態を確認
-- `python main.py config` で設定ダイアログを開いて認証
+### `JVOpen failed: -302`
 
-### COM の戻り値が期待と異なる
-`jvlink_session.py` の `open()` / `read()` メソッドで、
-COM の [out] パラメータの返し方を自動判定しているが、
-環境によってはタプルの構造が異なる場合がある。
+JV-Link の利用条件や設定が満たされていない可能性があります。`jvlink-config` を開いて設定を確認してください。
 
-デバッグ方法:
-```python
-import win32com.client
-jv = win32com.client.Dispatch("JVDTLab.JVLink")
-jv.JVInit("")
-result = jv.JVOpen("RACE", "20260101000000", 4, 0, 0, "")
-print(type(result), result)
-```
+### `verify` が失敗する
+
+object の欠損や破損が起きています。`current` と `previous` のどちらが壊れているかを確認し、必要なら再取得を検討してください。

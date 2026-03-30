@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jvlink-raw-fetcher"
+version = "0.1.0"
+description = "JV-Link raw data downloader and verifier"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "Open source contributors" }
+]
+dependencies = [
+  "pywin32>=306; platform_system == 'Windows'",
+]
+
+[project.optional-dependencies]
+dev = [
+  "ruff>=0.12.0",
+]
+
+[project.scripts]
+jvlink-raw-fetcher = "jvlink_raw_fetcher.cli:main"
+
+[tool.setuptools]
+packages = ["jvlink_raw_fetcher"]
+py-modules = [
+  "archive_store",
+  "config",
+  "job_runner",
+  "job_state",
+  "jvlink_session",
+  "raw_writer",
+  "main",
+]
+
+[tool.ruff]
+line-length = 100
+
